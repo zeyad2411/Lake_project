@@ -1,0 +1,209 @@
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+
+// HC-SR04 pins (USE GPIO numbers!)
+#define TRIG_PIN 5  // GPIO5 (D1 on NodeMCU)
+#define ECHO_PIN 4  // GPIO4 (D2 on NodeMCU)
+
+// Receiver ESP32's MAC address
+uint8_t receiverMac[] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
+
+typedef struct struct_message {
+  float distance_middle;
+} struct_message;
+
+struct_message myData;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != 0) {
+    Serial.println("❌ Error initializing ESP-NOW");
+    return;
+  }
+  Serial.println("✅ ESP-NOW Initialized");
+
+  esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+  esp_now_add_peer(receiverMac, ESP_NOW_ROLE_SLAVE, 1, NULL, 0);
+}
+
+float readHCSR04() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  float distance = duration * 0.0343 / 2; // cm
+
+  return distance;
+}
+
+void loop() {
+  myData.distance_middle = readHCSR04();
+
+  esp_now_send(receiverMac, (uint8_t *)&myData, sizeof(myData));
+  Serial.print("📤 Sent Distance Middle (HC-SR04): ");
+  Serial.print(myData.distance_middle);
+  Serial.println(" cm");
+
+  delay(5000); // Send every 5 seconds
+}
+--------------------------------------------
+#include <Wire.h>
+#include <VL53L1X.h>
+
+#define TINY_GSM_MODEM_SIM800
+#include <TinyGsmClient.h>
+#include <ArduinoHttpClient.h>
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h> 
+
+// SIM800L pins
+#define MODEM_RX 16
+#define MODEM_TX 17
+#define MODEM_PWRKEY 4
+#define MODEM_RST 5
+#define MODEM_POWER_ON 23
+
+// APN settings
+const char apn[]  = "internet";   
+const char user[] = "internet";   
+const char pass[] = "internet";   
+
+// ThingsBoard settings
+const char server[] = "demo.thingsboard.io"; 
+const char accessToken[] = "8wnldiv3o8hjbyx5vi7a"; 
+String path = "/api/v1/" + String(accessToken) + "/telemetry"; 
+
+VL53L1X sensor;
+TinyGsm modem(Serial1);
+TinyGsmClient client(modem);
+HttpClient http(client, server, 80);
+
+// Received HC-SR04 distance
+volatile float distance_middle = 0.0;
+bool distanceReceived = false;
+
+// ESP-NOW struct
+typedef struct struct_message {
+  float distance_middle;
+} struct_message;
+
+// ESP-NOW callback
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  struct_message myData;
+  memcpy(&myData, incomingData, sizeof(myData));
+  distance_middle = myData.distance_middle;
+  distanceReceived = true;
+  Serial.print("📥 Received Distance Middle (HC-SR04) via ESP-NOW: ");
+  Serial.print(distance_middle);
+  Serial.println(" cm");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // Set fake MAC Address
+  WiFi.mode(WIFI_STA);
+  uint8_t fakeMac[] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
+  esp_wifi_set_mac(WIFI_IF_STA, fakeMac);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("❌ Error initializing ESP-NOW");
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("✅ ESP-NOW Initialized on ESP32");
+
+  // Initialize VL53L1X
+  Serial.println("🔌 Initializing VL53L1X sensor...");
+  sensor.setTimeout(500);
+
+  if (!sensor.init()) {
+    Serial.println("❌ Failed to detect VL53L1X sensor!");
+    while (true);
+  }
+  sensor.setDistanceMode(VL53L1X::Long);
+  sensor.setMeasurementTimingBudget(50000);
+  sensor.startContinuous(50);
+
+  // Initialize SIM800L
+  Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+
+  Serial.println("🔄 Restarting Modem...");
+  if (!modem.restart()) {
+    Serial.println("❌ Modem restart failed!");
+    return;
+  }
+
+  Serial.println("📡 Connecting to GPRS...");
+  if (modem.gprsConnect(apn, user, pass)) {
+    Serial.println("✅ Connected to GPRS!");
+  } else {
+    Serial.println("❌ GPRS Connection FAILED! Check APN settings.");
+    return;
+  }
+
+  Serial.print("GPRS Status: ");
+  Serial.println(modem.isGprsConnected() ? "Connected" : "Not Connected");
+  Serial.print("Signal Strength: ");
+  Serial.println(modem.getSignalQuality());
+}
+
+void loop() {
+  int distance_edge = sensor.read(); // VL53L1X distance in mm
+
+  if (sensor.timeoutOccurred()) {
+    Serial.println("⚠️ Distance sensor timeout!");
+    return;
+  }
+
+  if (distanceReceived) {
+    String jsonPayload = "{\"distance_edge\":" + String(distance_edge) + ",\"distance_middle\":" + String(distance_middle) + "}";
+    sendToThingsBoard(jsonPayload);
+  } else {
+    Serial.println("⚠️ Waiting for distance_middle from ESP8266...");
+  }
+
+  delay(5000); // Send every 5 seconds
+}
+
+void sendToThingsBoard(const String &payload) {
+  Serial.print("📢 Sending JSON: ");
+  Serial.println(payload);
+
+  http.beginRequest();
+  http.post(path);
+  http.sendHeader("Content-Type", "application/json");
+  http.sendHeader("Content-Length", payload.length());
+  http.beginBody();
+  http.print(payload);
+  http.endRequest();
+
+  int statusCode = http.responseStatusCode();
+  String response = http.responseBody();
+
+  Serial.print("🌍 ThingsBoard Response Code: ");
+  Serial.println(statusCode);
+  Serial.print("📩 ThingsBoard Response Body: ");
+  Serial.println(response);
+
+  if (statusCode < 0) {
+    Serial.println("❌ Failed to send data to ThingsBoard.");
+  } else if (statusCode != 200) {
+    Serial.println("❌ ThingsBoard returned an error. Check response.");
+  } else {
+    Serial.println("✅ Data sent successfully!");
+  }
+}
+  z
